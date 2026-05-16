@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Ollama Multi-Chat</title>
+<link rel="stylesheet" href="/static/style.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "/static/vendor/three/three.module.js",
+    "three/addons/": "/static/vendor/three/addons/"
+  }
+}
+</script>
+</head>
+<body>
+<aside id="sidebar">
+  <header>
+    <h1>chats</h1>
+    <button id="new-btn">+ new</button>
+  </header>
+  <ul id="conv-list"></ul>
+</aside>
+
+<main id="main">
+  <div id="empty">Create or select a conversation.</div>
+
+  <section id="chat" hidden>
+    <header id="chat-header">
+      <div>
+        <h2 id="chat-title"></h2>
+        <div id="chat-meta"></div>
+      </div>
+      <div id="chat-controls"></div>
+    </header>
+    <div id="avatar-pane" hidden>
+      <div id="avatar-canvas"></div>
+      <div id="avatar-controls">
+        <button id="mic-btn" type="button" title="hold to talk (or hold Space)">🎤 hold to talk</button>
+        <button id="stop-btn" type="button" title="stop the avatar speaking">⏹ stop</button>
+        <div id="mic-status"></div>
+      </div>
+    </div>
+    <div id="messages"></div>
+    <form id="composer" hidden>
+      <textarea id="input" placeholder="message..." rows="2"></textarea>
+      <button type="submit">send</button>
+    </form>
+  </section>
+</main>
+
+<!-- Edit participants modal -->
+<div id="edit-modal" hidden>
+  <div class="modal-card">
+    <h2>edit conversation</h2>
+    <div id="edit-body"></div>
+    <div class="modal-actions">
+      <button id="edit-cancel" type="button">cancel</button>
+      <button id="edit-save" type="button">save</button>
+    </div>
+  </div>
+</div>
+
+<!-- New-conversation modal -->
+<div id="modal" hidden>
+  <div class="modal-card">
+    <h2>new conversation</h2>
+
+    <label>title <input id="f-title" placeholder="optional" /></label>
+
+    <label>mode
+      <select id="f-mode">
+        <option value="user_llm">user ↔ llm</option>
+        <option value="llm_llm">llm ↔ llm</option>
+      </select>
+    </label>
+
+    <div class="row" id="participants-fields"></div>
+
+    <fieldset>
+      <legend><label><input type="checkbox" id="f-referee-on" /> referee</label></legend>
+      <div id="referee-fields">
+        <label>model <select id="f-ref-model"></select></label>
+        <label>cadence (turns) <input id="f-ref-cadence" type="number" value="2" min="1" /></label>
+        <label><input id="f-ref-intervene" type="checkbox" /> inject into participants</label>
+        <label>system prompt
+          <textarea id="f-ref-system" rows="3">You are a neutral referee observing a conversation between two AI agents. After each batch of turns, offer brief commentary: who is being clearer, where the discussion is stuck, and what question would move it forward.</textarea>
+        </label>
+      </div>
+    </fieldset>
+
+    <label id="max-turns-label" hidden>max turns <input id="f-max-turns" type="number" value="20" min="1" /></label>
+
+    <label id="avatar-mode-label"><input id="f-avatar-mode" type="checkbox" /> avatar + voice mode (user ↔ llm only)</label>
+    <label id="avatar-voice-label">voice
+      <select id="f-tts-voice">
+        <option value="af_heart">af_heart (US female)</option>
+        <option value="af_bella">af_bella (US female)</option>
+        <option value="am_michael">am_michael (US male)</option>
+        <option value="am_adam">am_adam (US male)</option>
+        <option value="bf_emma">bf_emma (UK female)</option>
+        <option value="bm_george">bm_george (UK male)</option>
+      </select>
+    </label>
+
+    <div class="modal-actions">
+      <button id="f-cancel" type="button">cancel</button>
+      <button id="f-create" type="button">create</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

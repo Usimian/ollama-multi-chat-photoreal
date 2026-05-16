@@ -27,9 +27,14 @@ from typing import AsyncIterator, Optional
 import msgpack
 import numpy as np
 
-DITTO_DIR = os.path.expanduser("~/ditto-talkinghead")
+# Where the ditto-talkinghead checkout lives — used for the venv that has
+# torch+onnxruntime+the SDK, and as the import path for the SDK modules.
+# Override with $DITTO_DIR if you have it installed elsewhere.
+DITTO_DIR = os.path.abspath(os.path.expanduser(os.environ.get("DITTO_DIR", "~/ditto-talkinghead")))
 DITTO_PY = os.path.join(DITTO_DIR, ".venv/bin/python")
-DITTO_WORKER = os.path.join(DITTO_DIR, "ditto_worker.py")
+# The worker itself is vendored in this repo so deployment doesn't depend on
+# files inside the upstream Ditto checkout.
+DITTO_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker", "ditto_worker.py")
 DEFAULT_SOCK = "/tmp/ditto.sock"
 
 CHUNK_16K = 3200            # 200 ms @ 16 kHz mono
@@ -78,7 +83,9 @@ class DittoBridge:
         if os.path.exists(self.sock_path):
             os.unlink(self.sock_path)
         self._proc = await asyncio.create_subprocess_exec(
-            self.worker_python, self.worker_script, "--sock", self.sock_path,
+            self.worker_python, self.worker_script,
+            "--sock", self.sock_path,
+            "--ditto-dir", DITTO_DIR,
             cwd=DITTO_DIR,
         )
         # wait for socket

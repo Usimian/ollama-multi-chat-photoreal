@@ -10,6 +10,14 @@ let avatar = null;
 let audioQueue = null;
 let ptt = null;
 
+function stopEverything() {
+  if (audioQueue) audioQueue.stop();
+  if (avatar) avatar.stopSpeaking();
+  if (active && active.ws && active.ws.readyState === WebSocket.OPEN) {
+    active.ws.send(JSON.stringify({ type: "abort" }));
+  }
+}
+
 // ---------- boot ----------
 (async function init() {
   const r = await fetch("/api/models");
@@ -57,6 +65,7 @@ async function openConv(id) {
   const r = await fetch(`/api/conversations/${id}`);
   const conv = await r.json();
   const ws = new WebSocket(`ws://${location.host}/ws/${id}`);
+  ws.binaryType = "arraybuffer";
   active = { conv, ws };
   msgEls = {};
 
@@ -66,7 +75,17 @@ async function openConv(id) {
   $("messages").innerHTML = "";
   for (const m of conv.messages) renderMessage(m);
 
-  ws.onmessage = (e) => handleEvent(JSON.parse(e.data));
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string") {
+      handleEvent(JSON.parse(e.data));
+    } else {
+      // Binary frame: first byte is a type tag, rest is the payload.
+      const view = new Uint8Array(e.data);
+      const tag = view[0];
+      const payload = e.data.slice(1);
+      if (tag === 0x01 && avatar) avatar.paintJpeg(payload);
+    }
+  };
   ws.onclose = () => {};
   refreshList();
 }
@@ -112,6 +131,7 @@ function renderHeader() {
       renderHeader();
     }));
   }
+  controls.appendChild(btn("⏹ stop", "", stopEverything));
   const showThinking = $("messages").classList.contains("show-thinking");
   controls.appendChild(btn(showThinking ? "hide thinking" : "show thinking", "", () => {
     $("messages").classList.toggle("show-thinking");
@@ -127,6 +147,8 @@ function renderHeader() {
     e.preventDefault();
     const text = $("input").value.trim();
     if (!text) return;
+    if (audioQueue) audioQueue.reset();
+    if (avatar) avatar.reset();
     active.ws.send(JSON.stringify({ type: "user_message", content: text }));
     $("input").value = "";
   };
@@ -141,22 +163,18 @@ function renderHeader() {
 async function ensureAvatar() {
   if (avatar) return;
   avatar = new Avatar($("avatar-canvas"));
-  // Wire mic + audio immediately — don't block on the .glb network fetch.
   audioQueue = new AudioQueue(avatar);
   ptt = new PushToTalk({
-    button: $("mic-btn"),
-    onPressStart: () => { if (avatar) avatar.stopSpeaking(); },
+    button: $("talk-btn"),
+    onPressStart: stopEverything,
     onTranscript: (text) => {
       if (!active) return;
+      if (audioQueue) audioQueue.reset();
+      if (avatar) avatar.reset();
       active.ws.send(JSON.stringify({ type: "user_message", content: text }));
     },
   });
-  $("stop-btn").onclick = () => { if (avatar) avatar.stopSpeaking(); };
-  // Load the avatar mesh in the background so failures don't break voice.
-  avatar.load().catch((e) => {
-    console.error("avatar load failed:", e);
-    $("mic-status").textContent = `avatar load failed: ${e.message}`;
-  });
+  avatar.load().catch((e) => console.error("avatar load failed:", e));
 }
 
 function btn(label, cls, onClick) {
@@ -189,6 +207,10 @@ function handleEvent(ev) {
     }
     case "tts_chunk": {
       if (audioQueue) audioQueue.enqueueWavBase64(ev.audio_b64, ev.text || "");
+      break;
+    }
+    case "avatar_ready": {
+      if (avatar) avatar.onReady();
       break;
     }
     case "thinking": {

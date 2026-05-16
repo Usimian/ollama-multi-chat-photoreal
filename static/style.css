@@ -45,12 +45,11 @@ main#main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .msg .thinking { margin-top: 4px; padding: 6px 10px; border-left: 2px solid #4a5060; background: #12141a; color: #7a8296; font-size: 12px; font-style: italic; white-space: pre-wrap; border-radius: 0 6px 6px 0; display: none; }
 #messages.show-thinking .msg .thinking:not(:empty) { display: block; }
 
-#avatar-pane { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 12px; background: linear-gradient(180deg, #0f1115 0%, #1a1e27 100%); min-height: 300px; }
-#avatar-canvas { width: 100%; max-width: 420px; height: 480px; }
-#avatar-controls { display: flex; flex-direction: column; align-items: center; gap: 6px; margin-top: 8px; }
-#mic-btn { background: #2d4cdf; color: white; border: 0; padding: 14px 24px; border-radius: 28px; font-size: 14px; cursor: pointer; user-select: none; }
-#mic-btn:hover { background: #4060f0; }
-#mic-btn.recording { background: #cf3030; animation: pulse 1s infinite; }
+#avatar-pane { flex: 1; display: flex; align-items: stretch; justify-content: stretch; background: #0f1115; min-height: 0; overflow: hidden; }
+#avatar-canvas { width: 100%; height: 100%; display: block; background: #111; object-fit: contain; }
+#talk-btn { background: #2d4cdf; color: white; border: 0; padding: 0 18px; border-radius: 6px; font-size: 14px; cursor: pointer; user-select: none; }
+#talk-btn:hover { background: #4060f0; }
+#talk-btn.recording { background: #cf3030; animation: pulse 1s infinite; }
 @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.05); } }
 #mic-status { font-size: 11px; color: #8b93a7; min-height: 14px; }
 

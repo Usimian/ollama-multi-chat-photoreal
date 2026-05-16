@@ -22,9 +22,13 @@ from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from photoreal import DittoBridge
+
 OLLAMA_URL = "http://localhost:11434"
 STATIC_DIR = Path(__file__).parent / "static"
 DATA_DIR = Path(__file__).parent / "data"
+ASSET_DIR = Path(__file__).parent / "assets"
+AVATAR_REF = ASSET_DIR / "avatar_ref.jpg"
 DATA_DIR.mkdir(exist_ok=True)
 
 
@@ -140,6 +144,73 @@ async def broadcast(conv_id: str, event: dict) -> None:
         sockets[conv_id].discard(ws)
 
 
+async def broadcast_bytes(conv_id: str, payload: bytes) -> None:
+    dead = []
+    for ws in sockets.get(conv_id, set()):
+        try:
+            await ws.send_bytes(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        sockets[conv_id].discard(ws)
+
+
+# ---------- Ditto avatar bridge ----------
+
+_bridge: Optional[DittoBridge] = None
+_bridge_lock = asyncio.Lock()
+_avatar_sessions: dict[str, asyncio.Task] = {}    # cid -> frame fanout task
+_avatar_starting: dict[str, asyncio.Lock] = {}    # cid -> lock guarding open
+
+
+async def _get_bridge() -> DittoBridge:
+    """Lazy-start the singleton DittoBridge + worker subprocess."""
+    global _bridge
+    async with _bridge_lock:
+        if _bridge is None:
+            br = DittoBridge()
+            await br.start()
+            _bridge = br
+        return _bridge
+
+
+async def _frame_fanout(cid: str) -> None:
+    """Pull frames from the bridge and broadcast as binary ws messages.
+    Binary payload format: 1-byte type tag (0x01 = jpeg frame) + JPEG bytes."""
+    bridge = await _get_bridge()
+    try:
+        async for fr in bridge.frames(cid):
+            await broadcast_bytes(cid, b"\x01" + fr["jpeg"])
+    except Exception as e:
+        print(f"[avatar {cid}] fanout ended: {e!r}")
+
+
+async def ensure_avatar_session(cid: str) -> None:
+    """Open a Ditto session for this conv if not already running."""
+    lock = _avatar_starting.setdefault(cid, asyncio.Lock())
+    async with lock:
+        if cid in _avatar_sessions and not _avatar_sessions[cid].done():
+            return
+        if not AVATAR_REF.exists():
+            print(f"[avatar {cid}] ref image missing at {AVATAR_REF}; avatar disabled")
+            return
+        bridge = await _get_bridge()
+        await bridge.open_session(cid, ref_image_path=str(AVATAR_REF), max_size=512)
+        _avatar_sessions[cid] = asyncio.create_task(_frame_fanout(cid), name=f"avatar-{cid}")
+        await broadcast(cid, {"type": "avatar_ready"})
+
+
+async def close_avatar_session(cid: str) -> None:
+    task = _avatar_sessions.pop(cid, None)
+    if task and not task.done():
+        task.cancel()
+    if _bridge is not None:
+        try:
+            await _bridge.close_session(cid)
+        except Exception:
+            pass
+
+
 # ---------- Ollama ----------
 
 async def ollama_models() -> list[str]:
@@ -150,8 +221,15 @@ async def ollama_models() -> list[str]:
 
 
 async def ollama_stream(model: str, messages: list[dict]):
-    """Yield (content_delta, thinking_delta) pairs from Ollama /api/chat."""
+    """Yield (content_delta, thinking_delta) pairs from Ollama /api/chat.
+    `think: true` asks Ollama to route a thinking model's reasoning into
+    `message.thinking` instead of streaming it inline in `message.content`
+    with <think> tags. Only enable it for known thinking models — for
+    non-thinking models, some Ollama versions reject the param or change
+    streaming behavior."""
     payload = {"model": model, "messages": messages, "stream": True}
+    if any(tok in model.lower() for tok in ("deepseek-r1", "qwq", "thinking", "reasoning", "r1-")):
+        payload["think"] = True
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as r:
             r.raise_for_status()
@@ -229,16 +307,31 @@ def _pop_sentences(buffer: str, min_len: int = 8) -> tuple[list[str], str]:
 
 
 async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> None:
-    """Pop sentences, synthesize, broadcast tts_chunk events."""
+    """Pop sentences, synthesize, broadcast tts_chunk events. If a Ditto avatar
+    session is open for this conv, also feed the PCM to the bridge so the
+    avatar lip-syncs in step with the audio the browser plays.
+
+    Respects conv._abort: once set, pending sentences are drained without
+    synthesis so the worker stops both audio and bridge frames promptly."""
+    print(f"[tts {conv.id}] worker spawned, avatar_mode={conv.avatar_mode}, voice={conv.tts_voice}", flush=True)
     seq = 0
     while True:
         sentence = await queue.get()
         if sentence is None:
+            print(f"[tts {conv.id}] worker done", flush=True)
             return
+        print(f"[tts {conv.id}] got sentence: {sentence[:60]!r} abort={conv._abort.is_set()}", flush=True)
+        if conv._abort.is_set():
+            queue.task_done()
+            continue
         try:
             wav = await asyncio.to_thread(_synthesize, sentence, conv.tts_voice)
         except Exception as e:
-            print(f"TTS error: {e}")
+            print(f"[tts {conv.id}] _synthesize error: {e!r}", flush=True)
+            queue.task_done()
+            continue
+        print(f"[tts {conv.id}] synthesized {len(wav)} bytes", flush=True)
+        if conv._abort.is_set():
             queue.task_done()
             continue
         if wav:
@@ -249,6 +342,20 @@ async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> 
                 "text": sentence,
                 "audio_b64": base64.b64encode(wav).decode("ascii"),
             })
+            if conv.id in _avatar_sessions:
+                try:
+                    pcm, sr = sf.read(io.BytesIO(wav), dtype="float32", always_2d=False)
+                    if pcm.ndim == 2:
+                        pcm = pcm.mean(axis=1)
+                    if sr != 24000:
+                        n = int(round(len(pcm) * 24000 / sr))
+                        x_old = np.linspace(0, 1, len(pcm), endpoint=False)
+                        x_new = np.linspace(0, 1, n, endpoint=False)
+                        pcm = np.interp(x_new, x_old, pcm).astype(np.float32)
+                    bridge = await _get_bridge()
+                    await bridge.feed_audio_24k(conv.id, pcm)
+                except Exception as e:
+                    print(f"[avatar {conv.id}] feed failed: {e!r}")
             seq += 1
         queue.task_done()
 
@@ -368,6 +475,18 @@ async def run_llm_turn(conv: Conversation, speaker_idx: int) -> str:
             sentence_buffer = sentence_buffer.split("</think>", 1)[1].lstrip()
         if sentence_buffer.strip() and "<think>" not in sentence_buffer:
             await tts_queue.put(sentence_buffer.strip())
+        # Models like qwen3 emit the actual reply via Ollama's `thinking` field
+        # (t_delta), not the content stream. After the loop ends with empty
+        # content but non-empty thinking, the post-stream code below promotes
+        # thinking → content. Split it into sentences and queue each, so kokoro
+        # synthesizes manageable chunks (not one giant WAV that gets truncated).
+        if not msg.content.strip() and msg.thinking.strip():
+            text = msg.thinking.strip()
+            sentences, remainder = _pop_sentences(text)
+            for s in sentences:
+                await tts_queue.put(s)
+            if remainder.strip():
+                await tts_queue.put(remainder.strip())
         await tts_queue.put(None)  # signal end
         if tts_task is not None:
             try:
@@ -458,6 +577,26 @@ app = FastAPI()
 async def on_startup() -> None:
     load_all()
     print(f"loaded {len(conversations)} conversation(s) from {DATA_DIR}")
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    """Tear down the Ditto bridge so the worker subprocess doesn't leak.
+    Without this, every uvicorn restart orphans a worker holding many GB
+    of GPU memory until manually killed."""
+    global _bridge
+    for cid in list(_avatar_sessions.keys()):
+        try:
+            await close_avatar_session(cid)
+        except Exception:
+            pass
+    if _bridge is not None:
+        try:
+            await _bridge.shutdown()
+        except Exception as e:
+            print(f"bridge shutdown error: {e!r}")
+        _bridge = None
+        print("ditto bridge shut down")
 
 
 @app.get("/")
@@ -559,6 +698,7 @@ async def api_delete(cid: str):
         conv._stop.set()
         if conv._task:
             conv._task.cancel()
+    await close_avatar_session(cid)
     delete_persisted(cid)
     return {"ok": True}
 
@@ -574,6 +714,9 @@ async def ws_endpoint(ws: WebSocket, cid: str):
 
     sockets.setdefault(cid, set()).add(ws)
     await ws.send_json({"type": "snapshot", "conversation": conv.to_public()})
+
+    if conv.avatar_mode:
+        asyncio.create_task(ensure_avatar_session(cid))
 
     try:
         while True:
@@ -595,6 +738,10 @@ async def ws_endpoint(ws: WebSocket, cid: str):
                 if conv.mode == "user_llm" and not conv.running:
                     llm_idx = next((i for i, p in enumerate(conv.participants) if p.kind == "llm"), None)
                     if llm_idx is not None:
+                        # A user message starts a fresh turn — clear any leftover
+                        # stop/abort from a previous reply.
+                        conv._stop.clear()
+                        conv._abort.clear()
                         conv.running = True
                         await broadcast(cid, {"type": "state", "running": True})
 
@@ -659,3 +806,4 @@ async def ws_endpoint(ws: WebSocket, cid: str):
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/assets", StaticFiles(directory=ASSET_DIR), name="assets")

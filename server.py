@@ -186,9 +186,15 @@ async def ensure_avatar_session(cid: str) -> None:
         if not AVATAR_REF.exists():
             print(f"[avatar {cid}] ref image missing at {AVATAR_REF}; avatar disabled")
             return
+        print(f"[avatar {cid}] ensure: opening bridge session…", flush=True)
         bridge = await _get_bridge()
-        await bridge.open_session(cid, ref_image_path=str(AVATAR_REF), max_size=512)
+        try:
+            await bridge.open_session(cid, ref_image_path=str(AVATAR_REF), max_size=512)
+        except Exception as e:
+            print(f"[avatar {cid}] ensure: open_session failed: {e!r}", flush=True)
+            raise
         _avatar_sessions[cid] = asyncio.create_task(_frame_fanout(cid), name=f"avatar-{cid}")
+        print(f"[avatar {cid}] ensure: ready", flush=True)
         await broadcast(cid, {"type": "avatar_ready"})
 
 
@@ -336,7 +342,9 @@ async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> 
                 "text": sentence,
                 "audio_b64": base64.b64encode(wav).decode("ascii"),
             })
-            if conv.id in _avatar_sessions:
+            session_open = conv.id in _avatar_sessions
+            print(f"[avatar {conv.id}] feed-check: session_open={session_open}", flush=True)
+            if session_open:
                 try:
                     pcm, sr = sf.read(io.BytesIO(wav), dtype="float32", always_2d=False)
                     if pcm.ndim == 2:
@@ -348,6 +356,7 @@ async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> 
                         pcm = np.interp(x_new, x_old, pcm).astype(np.float32)
                     bridge = await _get_bridge()
                     await bridge.feed_audio_24k(conv.id, pcm)
+                    print(f"[avatar {conv.id}] fed {len(pcm)} samples to bridge", flush=True)
                 except Exception as e:
                     print(f"[avatar {conv.id}] feed failed: {e!r}")
             seq += 1
@@ -469,6 +478,17 @@ async def run_llm_turn(conv: Conversation, speaker_idx: int) -> str:
                 await asyncio.wait_for(tts_task, timeout=60)
             except asyncio.TimeoutError:
                 tts_task.cancel()
+        # Push 3 seconds of silence into Ditto so its LMDM lookahead buffer
+        # (~80 frames) gets flushed — otherwise the last ~3s of real audio
+        # never produces frames, and the avatar stops moving before the
+        # audio finishes.
+        if not conv._abort.is_set() and conv.id in _avatar_sessions:
+            try:
+                silence = np.zeros(24000 * 3, dtype=np.float32)
+                bridge = await _get_bridge()
+                await bridge.feed_audio_24k(conv.id, silence)
+            except Exception as e:
+                print(f"[avatar {conv.id}] tail-silence failed: {e!r}")
 
     await broadcast(conv.id, {"type": "message_end", "id": msg.id})
     persist(conv)
@@ -707,11 +727,11 @@ async def ws_endpoint(ws: WebSocket, cid: str):
             elif t == "abort":
                 conv._stop.set()
                 conv._abort.set()
-                # NOTE: we used to close the Ditto session here to flush its
-                # pipeline buffer; that caused a 90s+ reopen cycle on every
-                # abort and bridge timeouts piled up. Now we keep the session
-                # alive for the conversation's life and accept any residual
-                # frames from the prior turn (LMDM clip lookahead).
+                # Close the Ditto session entirely. The SDK has no mid-stream
+                # reset — close() joins its worker threads, the only clean
+                # way to flush its pipeline state. Next user_message reopens
+                # in the background (~5s warm, ~30s cold under VRAM pressure).
+                await close_avatar_session(cid)
                 await broadcast(cid, {"type": "state", "running": False})
 
             elif t == "reset_turns":

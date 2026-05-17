@@ -11,9 +11,14 @@ let audioQueue = null;
 let ptt = null;
 
 function stopEverything() {
+  // Always stop local audio/frame playback.
   if (audioQueue) audioQueue.stop();
   if (avatar) avatar.stopSpeaking();
-  if (active && active.ws && active.ws.readyState === WebSocket.OPEN) {
+  // Only send the server-side abort if a reply is actually in flight.
+  // Otherwise the abort would close the bridge session (heavy ~5s reopen)
+  // for no reason — e.g. on idle mic-press to start a new question.
+  if (active && active.conv && active.conv.running &&
+      active.ws && active.ws.readyState === WebSocket.OPEN) {
     active.ws.send(JSON.stringify({ type: "abort" }));
   }
 }

@@ -186,15 +186,9 @@ async def ensure_avatar_session(cid: str) -> None:
         if not AVATAR_REF.exists():
             print(f"[avatar {cid}] ref image missing at {AVATAR_REF}; avatar disabled")
             return
-        print(f"[avatar {cid}] ensure: opening bridge session…", flush=True)
         bridge = await _get_bridge()
-        try:
-            await bridge.open_session(cid, ref_image_path=str(AVATAR_REF), max_size=512)
-        except Exception as e:
-            print(f"[avatar {cid}] ensure: open_session failed: {e!r}", flush=True)
-            raise
+        await bridge.open_session(cid, ref_image_path=str(AVATAR_REF), max_size=512)
         _avatar_sessions[cid] = asyncio.create_task(_frame_fanout(cid), name=f"avatar-{cid}")
-        print(f"[avatar {cid}] ensure: ready", flush=True)
         await broadcast(cid, {"type": "avatar_ready"})
 
 
@@ -308,14 +302,11 @@ async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> 
 
     Respects conv._abort: once set, pending sentences are drained without
     synthesis so the worker stops both audio and bridge frames promptly."""
-    print(f"[tts {conv.id}] worker spawned, avatar_mode={conv.avatar_mode}, voice={conv.tts_voice}", flush=True)
     seq = 0
     while True:
         sentence = await queue.get()
         if sentence is None:
-            print(f"[tts {conv.id}] worker done", flush=True)
             return
-        print(f"[tts {conv.id}] got sentence: {sentence[:60]!r} abort={conv._abort.is_set()}", flush=True)
         if conv._abort.is_set():
             queue.task_done()
             continue
@@ -327,10 +318,9 @@ async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> 
         try:
             wav = await asyncio.to_thread(_synthesize, clean, conv.tts_voice)
         except Exception as e:
-            print(f"[tts {conv.id}] _synthesize error: {e!r}", flush=True)
+            print(f"[tts {conv.id}] synthesize error: {e!r}")
             queue.task_done()
             continue
-        print(f"[tts {conv.id}] synthesized {len(wav)} bytes", flush=True)
         if conv._abort.is_set():
             queue.task_done()
             continue
@@ -342,9 +332,7 @@ async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> 
                 "text": sentence,
                 "audio_b64": base64.b64encode(wav).decode("ascii"),
             })
-            session_open = conv.id in _avatar_sessions
-            print(f"[avatar {conv.id}] feed-check: session_open={session_open}", flush=True)
-            if session_open:
+            if conv.id in _avatar_sessions:
                 try:
                     pcm, sr = sf.read(io.BytesIO(wav), dtype="float32", always_2d=False)
                     if pcm.ndim == 2:
@@ -356,7 +344,6 @@ async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> 
                         pcm = np.interp(x_new, x_old, pcm).astype(np.float32)
                     bridge = await _get_bridge()
                     await bridge.feed_audio_24k(conv.id, pcm)
-                    print(f"[avatar {conv.id}] fed {len(pcm)} samples to bridge", flush=True)
                 except Exception as e:
                     print(f"[avatar {conv.id}] feed failed: {e!r}")
             seq += 1

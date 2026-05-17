@@ -64,18 +64,49 @@ export class Avatar {
     for (const r of w) r();
   }
 
-  // Simple 25 fps painter that pops one bitmap per tick. Imperfect sync (we
-  // know about the drift) but at least it actually plays.
+  // Painter is anchored to the audio clock (set by AudioQueue when first
+  // chunk begins playback). At each tick we compute the audio-elapsed time
+  // and paint up to the matching frame index, skipping ahead if we've fallen
+  // behind (e.g., GPU contention slowed Ditto's frame production). If no
+  // audio is playing (anchor null) we fall back to plain 25 fps wall-clock.
   _startTick() {
     if (this._tickHandle) return;
+    this._paintedIdx = 0;
     this._tickHandle = setInterval(() => {
-      const bm = this._frameBuf.shift();
-      if (bm) {
+      const anchor = this._audioAnchorCtxTime;
+      const ctx = this._audioCtx;
+      // Determine target frame index.
+      let target;
+      if (anchor != null && ctx) {
+        const elapsed = ctx.currentTime - anchor;
+        target = Math.max(0, Math.floor(elapsed * 25));
+      } else {
+        target = this._paintedIdx + 1;  // wall-clock advance
+      }
+      // Catch up: drop frames before target, paint the one at target.
+      while (this._paintedIdx < target && this._frameBuf.length > 1) {
+        const dropped = this._frameBuf.shift();
+        dropped?.close?.();
+        this._paintedIdx += 1;
+      }
+      if (this._paintedIdx <= target && this._frameBuf.length > 0) {
+        const bm = this._frameBuf.shift();
         this._paintBitmap(bm);
         this._lastBitmap?.close?.();
         this._lastBitmap = bm;
+        this._paintedIdx += 1;
       }
+      // If buffer is empty, hold last frame; audio keeps playing.
     }, 40);
+  }
+
+  // Called by AudioQueue when the first audio chunk of a burst actually
+  // begins playing (ctx.currentTime at src.start()). The painter then chases
+  // this clock instead of wall-clock so video and audio stay aligned even
+  // when the bridge produces frames in bursts or under GPU contention.
+  setAudioAnchor(ctxTime) {
+    this._audioAnchorCtxTime = ctxTime;
+    this._paintedIdx = 0;
   }
 
   async _loadIdleStill() {
@@ -165,6 +196,8 @@ export class Avatar {
     for (const bm of this._frameBuf) bm?.close?.();
     this._frameBuf = [];
     if (this._tickHandle) { clearInterval(this._tickHandle); this._tickHandle = null; }
+    this._audioAnchorCtxTime = null;
+    this._paintedIdx = 0;
     this._flushFirstFrameWaiters();   // unblock any waiting audio so it won't hang
     if (this._idleBitmap) this._paintBitmap(this._idleBitmap);
   }
@@ -216,35 +249,35 @@ export class AudioQueue {
   }
 
   async _play(wavBytes, gen, isFirst) {
-    console.log("[audio] _play start gen=", gen, "this._gen=", this._gen, "isFirst=", isFirst, "bytes=", wavBytes.length);
-    if (gen !== this._gen) { console.log("[audio] gen mismatch, skipping"); return; }
+    if (gen !== this._gen) return;
     const ctx = this.avatar.audioCtx;
-    console.log("[audio] ctx.state=", ctx.state, "currentTime=", ctx.currentTime);
     if (ctx.state === "suspended") {
-      try { await ctx.resume(); console.log("[audio] resumed, state=", ctx.state); } catch (e) { console.warn("[audio] resume failed:", e); }
+      try { await ctx.resume(); } catch {}
     }
     let buf;
     try {
       buf = await ctx.decodeAudioData(wavBytes.buffer.slice(0));
-      console.log("[audio] decoded, duration=", buf.duration, "channels=", buf.numberOfChannels, "rate=", buf.sampleRate);
     } catch (e) {
-      console.error("[audio] decode failed:", e);
+      console.error("audio decode failed:", e);
       return;
     }
-    if (gen !== this._gen) { console.log("[audio] gen mismatch post-decode, skipping"); return; }
+    if (gen !== this._gen) return;
+    // Gapless scheduling — start each chunk at the previous chunk's end-time.
+    // Without this, the onended → next-start microtask hop adds a small gap
+    // every chunk; over a long reply they accumulate and audio drifts behind
+    // wall-clock, so the painter (anchored to wall-clock) outruns the frames
+    // and the lips freeze mid-reply.
+    const now = ctx.currentTime;
+    const startAt = isFirst ? now + 0.05 : Math.max(now, this._nextStart);
+    this._nextStart = startAt + buf.duration;
+    if (isFirst) this.avatar.setAudioAnchor(startAt);
     return new Promise((resolve) => {
       const src = ctx.createBufferSource();
       src.buffer = buf;
       src.connect(ctx.destination);
-      src.onended = () => { console.log("[audio] onended"); if (this._active === src) this._active = null; resolve(); };
+      src.onended = () => { if (this._active === src) this._active = null; resolve(); };
       this._active = src;
-      try {
-        src.start();
-        console.log("[audio] src.start() ok");
-      } catch (e) {
-        console.error("[audio] src.start() threw:", e);
-        resolve();
-      }
+      try { src.start(startAt); } catch (e) { console.error("src.start failed:", e); resolve(); }
     });
   }
 
@@ -254,6 +287,7 @@ export class AudioQueue {
     this._active = null;
     this._chain = Promise.resolve();
     this._needFirstFrame = true;
+    this._nextStart = 0;
     clearTimeout(this._rearm);
   }
 

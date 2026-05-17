@@ -46,9 +46,16 @@ export class Avatar {
     this._loadIdleStill();
   }
 
-  // Awaitable: resolves on the next first frame after this call.
-  _waitForFirstFrame() {
-    return new Promise((resolve) => this._firstFrameResolvers.push(resolve));
+  // Awaitable: resolves on the next first frame OR after a hard timeout, so
+  // short replies (under Ditto's ~5 s clip floor, which produce no frames at
+  // all) still get their audio played instead of silently hanging.
+  _waitForFirstFrame(timeoutMs = 4000) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      this._firstFrameResolvers.push(finish);
+      setTimeout(finish, timeoutMs);
+    });
   }
 
   _flushFirstFrameWaiters() {

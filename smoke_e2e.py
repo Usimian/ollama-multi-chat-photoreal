@@ -16,7 +16,7 @@ import websockets
 BASE = "http://127.0.0.1:8765"
 WS = "ws://127.0.0.1:8765"
 OUT = os.path.join(os.path.dirname(__file__), "tmp")
-MODEL = "qwen2.5:7b"  # small, fast, in your installed list
+MODEL = "qwen3.6:35b"  # primary supported model
 
 
 async def main() -> int:

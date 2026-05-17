@@ -73,18 +73,6 @@
 
     <div class="row" id="participants-fields"></div>
 
-    <fieldset>
-      <legend><label><input type="checkbox" id="f-referee-on" /> referee</label></legend>
-      <div id="referee-fields">
-        <label>model <select id="f-ref-model"></select></label>
-        <label>cadence (turns) <input id="f-ref-cadence" type="number" value="2" min="1" /></label>
-        <label><input id="f-ref-intervene" type="checkbox" /> inject into participants</label>
-        <label>system prompt
-          <textarea id="f-ref-system" rows="3">You are a neutral referee observing a conversation between two AI agents. After each batch of turns, offer brief commentary: who is being clearer, where the discussion is stuck, and what question would move it forward.</textarea>
-        </label>
-      </div>
-    </fieldset>
-
     <label id="max-turns-label" hidden>max turns <input id="f-max-turns" type="number" value="20" min="1" /></label>
 
     <label id="avatar-mode-label"><input id="f-avatar-mode" type="checkbox" /> avatar + voice mode (user ↔ llm only)</label>

@@ -44,16 +44,9 @@ class Participant:
 @dataclass
 class Message:
     id: str
-    sender: int                     # participant index; -1 = referee; -2 = system note
+    sender: int                     # participant index; -2 = system note
     content: str
     thinking: str = ""
-
-@dataclass
-class Referee:
-    model: str
-    system: str
-    cadence: int = 2                # run every N turns
-    intervene: bool = False         # if True, inject into participants' context
 
 @dataclass
 class Conversation:
@@ -62,11 +55,11 @@ class Conversation:
     mode: str                       # "user_llm" | "llm_llm"
     participants: list[Participant]
     messages: list[Message] = field(default_factory=list)
-    referee: Optional[Referee] = None
     max_turns: int = 20
     turns_taken: int = 0            # counts LLM turns only
     avatar_mode: bool = False       # enable TTS + viseme broadcasting
     tts_voice: str = "af_heart"     # Kokoro voice id
+    thinking_mode: bool = False     # send think:True to Ollama (slower but more rigorous)
     running: bool = False
     _task: Optional[asyncio.Task] = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
@@ -79,11 +72,11 @@ class Conversation:
             "mode": self.mode,
             "participants": [asdict(p) for p in self.participants],
             "messages": [asdict(m) for m in self.messages],
-            "referee": asdict(self.referee) if self.referee else None,
             "max_turns": self.max_turns,
             "turns_taken": self.turns_taken,
             "avatar_mode": self.avatar_mode,
             "tts_voice": self.tts_voice,
+            "thinking_mode": self.thinking_mode,
             "running": self.running,
         }
 
@@ -115,18 +108,17 @@ def load_all() -> None:
             data = json.loads(path.read_text())
             participants = [Participant(**p) for p in data["participants"]]
             messages = [Message(**m) for m in data.get("messages", [])]
-            referee = Referee(**data["referee"]) if data.get("referee") else None
             conv = Conversation(
                 id=data["id"],
                 title=data["title"],
                 mode=data["mode"],
                 participants=participants,
                 messages=messages,
-                referee=referee,
                 max_turns=int(data.get("max_turns", 20)),
                 turns_taken=int(data.get("turns_taken", 0)),
                 avatar_mode=bool(data.get("avatar_mode", False)),
                 tts_voice=str(data.get("tts_voice", "af_heart")),
+                thinking_mode=bool(data.get("thinking_mode", False)),
             )
             conversations[conv.id] = conv
         except Exception as e:
@@ -220,16 +212,13 @@ async def ollama_models() -> list[str]:
         return sorted(m["name"] for m in r.json().get("models", []))
 
 
-async def ollama_stream(model: str, messages: list[dict]):
+async def ollama_stream(model: str, messages: list[dict], think: bool = True):
     """Yield (content_delta, thinking_delta) pairs from Ollama /api/chat.
-    `think: true` asks Ollama to route a thinking model's reasoning into
-    `message.thinking` instead of streaming it inline in `message.content`
-    with <think> tags. Only enable it for known thinking models — for
-    non-thinking models, some Ollama versions reject the param or change
-    streaming behavior."""
-    payload = {"model": model, "messages": messages, "stream": True}
-    if any(tok in model.lower() for tok in ("deepseek-r1", "qwq", "thinking", "reasoning", "r1-")):
-        payload["think"] = True
+    `think` matches conv.thinking_mode. With `/no_think` in the user message
+    AND `think: true`, qwen3 sometimes puts the reply into the thinking field
+    instead of content — they're conflicting signals. So when thinking is off
+    we set `think: false`, and when on we set `think: true`."""
+    payload = {"model": model, "messages": messages, "stream": True, "think": bool(think)}
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as r:
             r.raise_for_status()
@@ -324,8 +313,13 @@ async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> 
         if conv._abort.is_set():
             queue.task_done()
             continue
+        clean = _scrub_for_tts(sentence)
+        if not clean:
+            # Sentence was emojis-only — nothing to speak.
+            queue.task_done()
+            continue
         try:
-            wav = await asyncio.to_thread(_synthesize, sentence, conv.tts_voice)
+            wav = await asyncio.to_thread(_synthesize, clean, conv.tts_voice)
         except Exception as e:
             print(f"[tts {conv.id}] _synthesize error: {e!r}", flush=True)
             queue.task_done()
@@ -360,42 +354,53 @@ async def _tts_worker(conv: Conversation, msg_id: str, queue: asyncio.Queue) -> 
         queue.task_done()
 
 
-THINK_TAG_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
-
-
-async def strip_think_tags(conv: Conversation, msg: Message) -> None:
-    cleaned = THINK_TAG_RE.sub("", msg.content).lstrip()
-    if cleaned != msg.content:
-        msg.content = cleaned
-        await broadcast(conv.id, {"type": "replace_content", "id": msg.id, "content": cleaned})
-
-
-REPLY_NUDGE = (
-    "If you reason inside <think>...</think> tags, you MUST write your actual "
-    "reply AFTER the closing </think> tag. Keep reasoning concise. The reply "
-    "outside the think tags is what the other participant will see — never "
-    "leave it empty."
+# Strip emojis and most pictographic symbols before TTS — kokoro tries to
+# pronounce them ("rolling on the floor laughing face") which is jarring.
+# Covers the major emoji blocks; rare unmapped codepoints just pass through.
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"   # emoticons
+    "\U0001F300-\U0001F5FF"   # symbols & pictographs
+    "\U0001F680-\U0001F6FF"   # transport
+    "\U0001F700-\U0001F77F"   # alchemical
+    "\U0001F780-\U0001F7FF"   # geometric ext
+    "\U0001F800-\U0001F8FF"   # arrows ext
+    "\U0001F900-\U0001F9FF"   # supplemental symbols & pictographs
+    "\U0001FA00-\U0001FA6F"   # chess, symbols & pictographs ext-a
+    "\U0001FA70-\U0001FAFF"   # symbols & pictographs ext-b
+    "\U00002600-\U000026FF"   # misc symbols
+    "\U00002700-\U000027BF"   # dingbats
+    "\U0001F1E0-\U0001F1FF"   # flags
+    "‍"                    # ZWJ
+    "️"                    # variation selector-16
+    "]+",
+    flags=re.UNICODE,
 )
+
+
+def _scrub_for_tts(text: str) -> str:
+    return EMOJI_RE.sub(" ", text).strip()
 
 
 def build_messages_for(conv: Conversation, speaker_idx: int) -> list[dict]:
     """Transcript from one participant's POV.
 
-    Its own prior messages are 'assistant', everyone else's (including referee
-    interventions) are 'user'. Referee messages are only included as visible
-    context if referee.intervene is True.
+    Its own prior messages are 'assistant', everyone else's are 'user'.
+    Thinking is controlled solely via Ollama's `think: true/false` API
+    parameter — no model-side directives, no system-prompt nudging.
     """
     speaker = conv.participants[speaker_idx]
     out: list[dict] = []
-    system_text = (speaker.system or "").strip()
-    system_text = f"{system_text}\n\n{REPLY_NUDGE}" if system_text else REPLY_NUDGE
-    out.append({"role": "system", "content": system_text})
+    if (speaker.system or "").strip():
+        out.append({"role": "system", "content": speaker.system.strip()})
     for m in conv.messages:
-        if m.sender == -2:
-            continue  # internal note
-        if m.sender == -1:
-            if conv.referee and conv.referee.intervene:
-                out.append({"role": "user", "content": f"[REFEREE]: {m.content}"})
+        if m.sender < 0:
+            continue  # internal note (was -1 referee or -2 system)
+        if not m.content.strip():
+            # Skip empty turns. Sending an empty assistant message confuses
+            # chat models (they try to "complete" it, dumping reasoning into
+            # the wrong field). Skipping empty user messages just keeps the
+            # transcript clean.
             continue
         if m.sender == speaker_idx:
             out.append({"role": "assistant", "content": m.content})
@@ -406,59 +411,44 @@ def build_messages_for(conv: Conversation, speaker_idx: int) -> list[dict]:
     return out
 
 
-def build_messages_for_referee(conv: Conversation) -> list[dict]:
-    assert conv.referee
-    transcript_lines = []
-    for m in conv.messages:
-        if m.sender == -2:
-            continue
-        if m.sender == -1:
-            transcript_lines.append(f"REFEREE (you, earlier): {m.content}")
-        else:
-            name = conv.participants[m.sender].name
-            transcript_lines.append(f"{name}: {m.content}")
-    transcript = "\n".join(transcript_lines) or "(no messages yet)"
-    return [
-        {"role": "system", "content": f"{conv.referee.system}\n\n{REPLY_NUDGE}"},
-        {"role": "user", "content": f"Transcript so far:\n\n{transcript}\n\nProvide your commentary."},
-    ]
-
-
 # ---------- Turn execution ----------
 
 async def run_llm_turn(conv: Conversation, speaker_idx: int) -> str:
+    """Stream one LLM turn from Ollama. qwen3.6 routes reasoning into the
+    `thinking` field (visible in the UI under "show thinking") and the actual
+    reply into `content` (streamed as text + TTS'd as sentences complete)."""
     speaker = conv.participants[speaker_idx]
     assert speaker.kind == "llm" and speaker.model
 
     msg = Message(id=str(uuid.uuid4()), sender=speaker_idx, content="")
+    # Build the request BEFORE appending the new (empty) placeholder. If we
+    # appended first, Ollama would receive a trailing empty assistant message,
+    # which qwen3 interprets as "complete this empty turn" and dumps its
+    # reasoning into content. Verified empirically with qwen3.6:35b.
+    request_messages = build_messages_for(conv, speaker_idx)
     conv.messages.append(msg)
     await broadcast(conv.id, {"type": "message_start", "message": asdict(msg)})
 
-    tts_enabled = conv.avatar_mode
-    tts_queue: Optional[asyncio.Queue] = asyncio.Queue() if tts_enabled else None
+    tts_queue: Optional[asyncio.Queue] = asyncio.Queue() if conv.avatar_mode else None
     tts_task: Optional[asyncio.Task] = (
         asyncio.create_task(_tts_worker(conv, msg.id, tts_queue)) if tts_queue else None
     )
     sentence_buffer = ""
-    last_content_offset = 0  # position in msg.content up to which we've considered sentences
-
     try:
-        async for c_delta, t_delta in ollama_stream(speaker.model, build_messages_for(conv, speaker_idx)):
+        async for c_delta, t_delta in ollama_stream(
+            speaker.model,
+            request_messages,
+            think=conv.thinking_mode,
+        ):
             if conv._abort.is_set():
                 break
+            # Ollama splits the stream for us: c_delta is the answer text only,
+            # t_delta is the reasoning. We just route them to the right places.
             if c_delta:
                 msg.content += c_delta
                 await broadcast(conv.id, {"type": "token", "id": msg.id, "delta": c_delta})
                 if tts_queue is not None:
-                    # Operate on the suffix of content that hasn't been split into sentences yet,
-                    # but exclude any leading think-block (server strips after stream completes).
                     sentence_buffer += c_delta
-                    # Drop everything up to and including a closing </think> if present in the buffer.
-                    if "</think>" in sentence_buffer:
-                        sentence_buffer = sentence_buffer.split("</think>", 1)[1].lstrip()
-                    if "<think>" in sentence_buffer:
-                        # we're inside a think block — drop the buffer; will reset on </think>
-                        continue
                     sentences, sentence_buffer = _pop_sentences(sentence_buffer)
                     for s in sentences:
                         await tts_queue.put(s)
@@ -469,70 +459,20 @@ async def run_llm_turn(conv: Conversation, speaker_idx: int) -> str:
         msg.content += f"\n\n[error: {e}]"
         await broadcast(conv.id, {"type": "token", "id": msg.id, "delta": f"\n\n[error: {e}]"})
 
-    # Flush remaining buffer as a final sentence (if any).
+    # Tail flush: any remaining partial sentence in the clean buffer.
     if tts_queue is not None:
-        if "</think>" in sentence_buffer:
-            sentence_buffer = sentence_buffer.split("</think>", 1)[1].lstrip()
-        if sentence_buffer.strip() and "<think>" not in sentence_buffer:
+        if sentence_buffer.strip():
             await tts_queue.put(sentence_buffer.strip())
-        # Models like qwen3 emit the actual reply via Ollama's `thinking` field
-        # (t_delta), not the content stream. After the loop ends with empty
-        # content but non-empty thinking, the post-stream code below promotes
-        # thinking → content. Split it into sentences and queue each, so kokoro
-        # synthesizes manageable chunks (not one giant WAV that gets truncated).
-        if not msg.content.strip() and msg.thinking.strip():
-            text = msg.thinking.strip()
-            sentences, remainder = _pop_sentences(text)
-            for s in sentences:
-                await tts_queue.put(s)
-            if remainder.strip():
-                await tts_queue.put(remainder.strip())
-        await tts_queue.put(None)  # signal end
+        await tts_queue.put(None)
         if tts_task is not None:
             try:
                 await asyncio.wait_for(tts_task, timeout=60)
             except asyncio.TimeoutError:
                 tts_task.cancel()
 
-    await strip_think_tags(conv, msg)
-    if not msg.content.strip() and msg.thinking.strip():
-        msg.content = msg.thinking
-        msg.thinking = ""
-        await broadcast(conv.id, {"type": "replace_content", "id": msg.id, "content": msg.content})
-        await broadcast(conv.id, {"type": "promote_thinking", "id": msg.id})
-
     await broadcast(conv.id, {"type": "message_end", "id": msg.id})
     persist(conv)
     return msg.content
-
-
-async def run_referee(conv: Conversation) -> None:
-    if not conv.referee:
-        return
-    msg = Message(id=str(uuid.uuid4()), sender=-1, content="")
-    conv.messages.append(msg)
-    await broadcast(conv.id, {"type": "message_start", "message": asdict(msg)})
-    try:
-        async for c_delta, t_delta in ollama_stream(conv.referee.model, build_messages_for_referee(conv)):
-            if conv._abort.is_set():
-                break
-            if c_delta:
-                msg.content += c_delta
-                await broadcast(conv.id, {"type": "token", "id": msg.id, "delta": c_delta})
-            if t_delta:
-                msg.thinking += t_delta
-                await broadcast(conv.id, {"type": "thinking", "id": msg.id, "delta": t_delta})
-    except Exception as e:
-        msg.content += f"\n\n[referee error: {e}]"
-        await broadcast(conv.id, {"type": "token", "id": msg.id, "delta": f"\n\n[referee error: {e}]"})
-    await strip_think_tags(conv, msg)
-    if not msg.content.strip() and msg.thinking.strip():
-        msg.content = msg.thinking
-        msg.thinking = ""
-        await broadcast(conv.id, {"type": "replace_content", "id": msg.id, "content": msg.content})
-        await broadcast(conv.id, {"type": "promote_thinking", "id": msg.id})
-    await broadcast(conv.id, {"type": "message_end", "id": msg.id})
-    persist(conv)
 
 
 async def llm_llm_loop(conv: Conversation) -> None:
@@ -555,9 +495,6 @@ async def llm_llm_loop(conv: Conversation) -> None:
 
             if conv._stop.is_set():
                 break
-
-            if conv.referee and conv.turns_taken % conv.referee.cadence == 0:
-                await run_referee(conv)
 
             idx = 1 - idx
             await asyncio.sleep(0)  # yield
@@ -631,16 +568,15 @@ async def api_list():
 async def api_create(spec: dict):
     cid = str(uuid.uuid4())[:8]
     participants = [Participant(**p) for p in spec["participants"]]
-    referee = Referee(**spec["referee"]) if spec.get("referee") else None
     conv = Conversation(
         id=cid,
         title=spec.get("title") or f"conv-{cid}",
         mode=spec["mode"],
         participants=participants,
-        referee=referee,
         max_turns=int(spec.get("max_turns", 20)),
         avatar_mode=bool(spec.get("avatar_mode", False)),
         tts_voice=str(spec.get("tts_voice", "af_heart")),
+        thinking_mode=bool(spec.get("thinking_mode", False)),
     )
     conversations[cid] = conv
     persist(conv)
@@ -668,6 +604,8 @@ async def api_patch(cid: str, patch: dict):
         conv.avatar_mode = bool(patch["avatar_mode"])
     if "tts_voice" in patch:
         conv.tts_voice = str(patch["tts_voice"])
+    if "thinking_mode" in patch:
+        conv.thinking_mode = bool(patch["thinking_mode"])
     for pu in patch.get("participants", []):
         i = int(pu["index"])
         if 0 <= i < len(conv.participants):
@@ -675,17 +613,6 @@ async def api_patch(cid: str, patch: dict):
             if "name" in pu: p.name = pu["name"]
             if "model" in pu: p.model = pu["model"]
             if "system" in pu: p.system = pu["system"]
-    if "referee" in patch:
-        r = patch["referee"]
-        if r is None:
-            conv.referee = None
-        elif conv.referee:
-            if "model" in r: conv.referee.model = r["model"]
-            if "system" in r: conv.referee.system = r["system"]
-            if "cadence" in r: conv.referee.cadence = int(r["cadence"])
-            if "intervene" in r: conv.referee.intervene = bool(r["intervene"])
-        else:
-            conv.referee = Referee(**r)
     persist(conv)
     await broadcast(cid, {"type": "snapshot", "conversation": conv.to_public()})
     return conv.to_public()
@@ -742,6 +669,14 @@ async def ws_endpoint(ws: WebSocket, cid: str):
                         # stop/abort from a previous reply.
                         conv._stop.clear()
                         conv._abort.clear()
+                        # Kick the avatar session opener in the background but
+                        # don't block — Ditto cold-start can take >30s when
+                        # Ollama is loading qwen3 into the same VRAM, and we
+                        # don't want the LLM/text reply to wait. If the bridge
+                        # isn't ready by the time the first TTS chunk arrives,
+                        # that one reply just won't be lip-synced.
+                        if conv.avatar_mode:
+                            asyncio.create_task(ensure_avatar_session(cid))
                         conv.running = True
                         await broadcast(cid, {"type": "state", "running": True})
 
@@ -749,8 +684,6 @@ async def ws_endpoint(ws: WebSocket, cid: str):
                             try:
                                 await run_llm_turn(conv, llm_idx)
                                 conv.turns_taken += 1
-                                if conv.referee and conv.turns_taken % conv.referee.cadence == 0:
-                                    await run_referee(conv)
                             finally:
                                 conv.running = False
                                 await broadcast(cid, {"type": "state", "running": False, "turns_taken": conv.turns_taken})
@@ -774,6 +707,11 @@ async def ws_endpoint(ws: WebSocket, cid: str):
             elif t == "abort":
                 conv._stop.set()
                 conv._abort.set()
+                # NOTE: we used to close the Ditto session here to flush its
+                # pipeline buffer; that caused a 90s+ reopen cycle on every
+                # abort and bridge timeouts piled up. Now we keep the session
+                # alive for the conversation's life and accept any residual
+                # frames from the prior turn (LMDM clip lookahead).
                 await broadcast(cid, {"type": "state", "running": False})
 
             elif t == "reset_turns":

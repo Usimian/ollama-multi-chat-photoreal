@@ -129,7 +129,7 @@ class DittoBridge:
 
     # ---------- session ops ----------
 
-    async def open_session(self, conv_id: str, ref_image_path: str, max_size: int = 512, ready_timeout: float = 30.0) -> None:
+    async def open_session(self, conv_id: str, ref_image_path: str, max_size: int = 512, ready_timeout: float = 300.0) -> None:
         if conv_id in self._sessions:
             await self.close_session(conv_id)
         sess = _Session(conv_id=conv_id)

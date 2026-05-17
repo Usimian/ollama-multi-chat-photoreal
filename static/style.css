@@ -40,8 +40,6 @@ main#main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .msg.llm .bubble { background: #1e2432; border: 1px solid #2a3040; }
 .msg.llm-0 .bubble { background: #1e2432; }
 .msg.llm-1 .bubble { background: #2a2030; }
-.msg.referee .bubble { background: #2b2a15; border: 1px dashed #7a7540; color: #d8cf90; font-style: italic; }
-#messages.hide-referee .msg.referee { display: none; }
 .msg .thinking { margin-top: 4px; padding: 6px 10px; border-left: 2px solid #4a5060; background: #12141a; color: #7a8296; font-size: 12px; font-style: italic; white-space: pre-wrap; border-radius: 0 6px 6px 0; display: none; }
 #messages.show-thinking .msg .thinking:not(:empty) { display: block; }
 

@@ -101,7 +101,7 @@ function renderHeader() {
   const { conv } = active;
   $("chat-title").textContent = conv.title;
   const parts = conv.participants.map((p) => `${p.name}${p.model ? ` (${p.model})` : ""}`).join(" ↔ ");
-  const ref = conv.referee ? ` · referee: ${conv.referee.model}` : "";
+  const ref = "";
   const av = conv.avatar_mode ? ` · 🎤 avatar` : "";
   $("chat-meta").textContent = `${parts}${ref}${av} · turns ${conv.turns_taken}/${conv.max_turns}`;
 
@@ -124,21 +124,20 @@ function renderHeader() {
     }
     controls.appendChild(btn("reset turns", "", () => active.ws.send(JSON.stringify({ type: "reset_turns" }))));
   }
-  if (conv.referee) {
-    const hidden = $("messages").classList.contains("hide-referee");
-    controls.appendChild(btn(hidden ? "show referee" : "hide referee", "", () => {
-      $("messages").classList.toggle("hide-referee");
-      renderHeader();
-    }));
-  }
-  controls.appendChild(btn("⏹ stop", "", stopEverything));
-  const showThinking = $("messages").classList.contains("show-thinking");
-  controls.appendChild(btn(showThinking ? "hide thinking" : "show thinking", "", () => {
-    $("messages").classList.toggle("show-thinking");
+  controls.appendChild(btn("⏹ stop", "danger", stopEverything));
+  const thinkOn = !!conv.thinking_mode;
+  controls.appendChild(btn(thinkOn ? "🧠 thinking: on" : "🧠 thinking: off", thinkOn ? "primary" : "", async () => {
+    const r = await fetch(`/api/conversations/${conv.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thinking_mode: !thinkOn }),
+    });
+    const updated = await r.json();
+    active.conv = updated;
     renderHeader();
   }));
   controls.appendChild(btn("edit", "", openEditModal));
-  controls.appendChild(btn("clear", "danger", () => {
+  controls.appendChild(btn("clear", "", () => {
     active.ws.send(JSON.stringify({ type: "clear_messages" }));
   }));
 
@@ -253,11 +252,11 @@ function renderMessage(m) {
   const el = document.createElement("div");
   el.className = "msg";
   let who = "";
-  if (m.sender === -1) {
-    el.classList.add("referee");
-    who = "referee";
+  if (m.sender < 0) {
+    el.classList.add("system");
+    who = "system";
   } else {
-    const p = conv.participants[m.sender];
+    const p = active.conv.participants[m.sender];
     who = p.name;
     if (p.kind === "user") { el.classList.add("user", "me"); }
     else { el.classList.add("llm", `llm-${m.sender}`); }
@@ -277,27 +276,29 @@ function scrollBottom() {
 
 // ---------- modal ----------
 function wireModal() {
-  fillModelSelect($("f-ref-model"));
   $("f-cancel").onclick = closeModal;
   $("f-create").onclick = createConv;
   $("edit-cancel").onclick = () => { $("edit-modal").hidden = true; };
   $("edit-save").onclick = saveEditModal;
   $("f-mode").onchange = renderParticipantFields;
-  $("f-avatar-mode").onchange = renderParticipantFields;
-  $("f-referee-on").onchange = () => {
-    $("f-ref-model").disabled = !$("f-referee-on").checked;
-    $("f-ref-cadence").disabled = !$("f-referee-on").checked;
-    $("f-ref-intervene").disabled = !$("f-referee-on").checked;
-    $("f-ref-system").disabled = !$("f-referee-on").checked;
+  // Avatar toggle only affects the voice dropdown's visibility — DON'T
+  // re-render participant cards (that wipes anything typed into the system
+  // prompt textarea).
+  $("f-avatar-mode").onchange = () => {
+    const allowAvatar = $("f-mode").value === "user_llm";
+    $("avatar-voice-label").hidden = !allowAvatar || !$("f-avatar-mode").checked;
   };
 }
 
 function openModal() {
   $("modal").hidden = false;
   renderParticipantFields();
-  $("f-referee-on").onchange();
 }
 function closeModal() { $("modal").hidden = true; }
+
+// Preferred default when populating a model dropdown. If a matching model is
+// installed, it gets pre-selected; otherwise we fall back to the first option.
+const DEFAULT_MODEL = "qwen3.6:35b";
 
 function fillModelSelect(sel) {
   sel.innerHTML = "";
@@ -306,6 +307,7 @@ function fillModelSelect(sel) {
     o.value = m; o.textContent = m;
     sel.appendChild(o);
   }
+  if (models.includes(DEFAULT_MODEL)) sel.value = DEFAULT_MODEL;
 }
 
 function renderParticipantFields() {
@@ -368,14 +370,6 @@ async function createConv() {
     avatar_mode: mode === "user_llm" && $("f-avatar-mode").checked,
     tts_voice: $("f-tts-voice").value,
   };
-  if ($("f-referee-on").checked) {
-    body.referee = {
-      model: $("f-ref-model").value,
-      system: $("f-ref-system").value,
-      cadence: parseInt($("f-ref-cadence").value || "2", 10),
-      intervene: $("f-ref-intervene").checked,
-    };
-  }
 
   const r = await fetch("/api/conversations", {
     method: "POST",
@@ -436,26 +430,6 @@ function openEditModal() {
     body.appendChild(card);
   }
 
-  if (conv.referee) {
-    const card = document.createElement("div");
-    card.className = "participant-card";
-    card.dataset.ref = "1";
-    card.innerHTML = `
-      <h3>referee</h3>
-      <label>model <select data-k="model"></select></label>
-      <label>cadence <input data-k="cadence" type="number" min="1" /></label>
-      <label><input data-k="intervene" type="checkbox" /> inject into participants</label>
-      <label>system prompt <textarea data-k="system" rows="5"></textarea></label>
-    `;
-    const sel = card.querySelector("select");
-    fillModelSelect(sel);
-    sel.value = conv.referee.model || "";
-    card.querySelector('[data-k=cadence]').value = conv.referee.cadence;
-    card.querySelector('[data-k=intervene]').checked = !!conv.referee.intervene;
-    card.querySelector('[data-k=system]').value = conv.referee.system || "";
-    body.appendChild(card);
-  }
-
   $("edit-modal").hidden = false;
 }
 
@@ -469,14 +443,7 @@ async function saveEditModal() {
       patch.tts_voice = card.querySelector('[data-k=tts_voice]').value;
       return;
     }
-    if (card.dataset.ref === "1") {
-      patch.referee = {
-        model: card.querySelector('[data-k=model]').value,
-        system: card.querySelector('[data-k=system]').value,
-        cadence: parseInt(card.querySelector('[data-k=cadence]').value, 10),
-        intervene: card.querySelector('[data-k=intervene]').checked,
-      };
-    } else {
+    {
       patch.participants.push({
         index: parseInt(card.dataset.index, 10),
         name: card.querySelector('[data-k=name]').value,

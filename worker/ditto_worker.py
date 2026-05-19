@@ -206,10 +206,15 @@ def serve(sock_path: str) -> None:
     print(f"[ditto_worker] listening on {sock_path} (ditto_dir={DITTO_DIR})", flush=True)
     try:
         while True:
-            conn, _ = srv.accept()
+            try:
+                conn, _ = srv.accept()
+            except KeyboardInterrupt:
+                break
             print("[ditto_worker] client connected", flush=True)
             try:
                 handle_client(conn)
+            except KeyboardInterrupt:
+                break
             finally:
                 conn.close()
                 print("[ditto_worker] client disconnected", flush=True)

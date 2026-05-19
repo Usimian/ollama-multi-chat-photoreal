@@ -10,6 +10,25 @@ let avatar = null;
 let audioQueue = null;
 let ptt = null;
 
+// iOS Safari keeps AudioContext muted until resume() runs synchronously inside
+// a user gesture. Prime it on the first pointerdown anywhere on the page.
+window.__primedCtx = null;
+function primeAudioOnce() {
+  document.removeEventListener("click", primeAudioOnce, true);
+  document.removeEventListener("touchend", primeAudioOnce, true);
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  const ctx = new Ctx();
+  window.__primedCtx = ctx;
+  const src = ctx.createBufferSource();
+  src.buffer = ctx.createBuffer(1, 1, 22050);
+  src.connect(ctx.destination);
+  try { src.start(0); } catch {}
+  ctx.resume().catch(() => {});
+}
+document.addEventListener("click", primeAudioOnce, true);
+document.addEventListener("touchend", primeAudioOnce, true);
+
 function stopEverything() {
   // Always stop local audio/frame playback.
   if (audioQueue) audioQueue.stop();
@@ -69,7 +88,8 @@ async function openConv(id) {
   closeConv();
   const r = await fetch(`/api/conversations/${id}`);
   const conv = await r.json();
-  const ws = new WebSocket(`ws://${location.host}/ws/${id}`);
+  const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${wsProto}//${location.host}/ws/${id}`);
   ws.binaryType = "arraybuffer";
   active = { conv, ws };
   msgEls = {};
@@ -165,8 +185,8 @@ function renderHeader() {
 }
 
 async function ensureAvatar() {
-  if (avatar) return;
-  avatar = new Avatar($("avatar-canvas"));
+  if (audioQueue) return;
+  if (!avatar) avatar = new Avatar($("avatar-canvas"));
   audioQueue = new AudioQueue(avatar);
   ptt = new PushToTalk({
     button: $("talk-btn"),
@@ -178,6 +198,8 @@ async function ensureAvatar() {
       active.ws.send(JSON.stringify({ type: "user_message", content: text }));
     },
   });
+  ptt.bindElement($("avatar-canvas"));
+  $("avatar-canvas").style.touchAction = "none";
   avatar.load().catch((e) => console.error("avatar load failed:", e));
 }
 

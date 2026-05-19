@@ -137,7 +137,9 @@ export class Avatar {
   }
 
   get audioCtx() {
-    if (!this._audioCtx) this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!this._audioCtx) {
+      this._audioCtx = window.__primedCtx || new (window.AudioContext || window.webkitAudioContext)();
+    }
     return this._audioCtx;
   }
 
@@ -232,7 +234,6 @@ export class AudioQueue {
   enqueueWavBase64(b64, text = "") {
     const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
     const myGen = this._gen;
-    console.log("[audio] enqueue chunk, bytes=", bytes.length, "needFirstFrame=", this._needFirstFrame, "gen=", myGen);
     if (this._needFirstFrame) {
       this._needFirstFrame = false;
       this._chain = this._chain
@@ -307,14 +308,9 @@ export class PushToTalk {
     this.chunks = [];
     this.recording = false;
 
-    const begin = (e) => { e.preventDefault(); this.start(); };
-    const end = (e) => { e.preventDefault(); this.stop(); };
-
-    button.addEventListener("mousedown", begin);
-    button.addEventListener("mouseup", end);
-    button.addEventListener("mouseleave", () => { if (this.recording) this.stop(); });
-    button.addEventListener("touchstart", begin);
-    button.addEventListener("touchend", end);
+    this._begin = (e) => { e.preventDefault(); this.start(); };
+    this._end = (e) => { e.preventDefault(); this.stop(); };
+    this.bindElement(button);
 
     window.addEventListener("keydown", (e) => {
       if (e.code === "Space" && !e.repeat && !this._isTyping(e.target)) {
@@ -328,6 +324,14 @@ export class PushToTalk {
         this.stop();
       }
     });
+  }
+
+  bindElement(el) {
+    el.addEventListener("mousedown", this._begin);
+    el.addEventListener("mouseup", this._end);
+    el.addEventListener("mouseleave", () => { if (this.recording) this.stop(); });
+    el.addEventListener("touchstart", this._begin);
+    el.addEventListener("touchend", this._end);
   }
 
   _isTyping(el) {

@@ -374,8 +374,13 @@ EMOJI_RE = re.compile(
 )
 
 
+MD_MARKUP_RE = re.compile(r"[*_`#~]+")
+
+
 def _scrub_for_tts(text: str) -> str:
-    return EMOJI_RE.sub(" ", text).strip()
+    text = EMOJI_RE.sub(" ", text)
+    text = MD_MARKUP_RE.sub("", text)
+    return text.strip()
 
 
 def build_messages_for(conv: Conversation, speaker_idx: int) -> list[dict]:
@@ -529,6 +534,10 @@ async def on_shutdown() -> None:
     Without this, every uvicorn restart orphans a worker holding many GB
     of GPU memory until manually killed."""
     global _bridge
+    for conv in conversations.values():
+        if conv._task and not conv._task.done():
+            conv._abort.set()
+            conv._task.cancel()
     for cid in list(_avatar_sessions.keys()):
         try:
             await close_avatar_session(cid)
@@ -545,7 +554,15 @@ async def on_shutdown() -> None:
 
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
+
+
+@app.middleware("http")
+async def no_cache_static(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith(("/static/", "/assets/")):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/api/models")

@@ -8,8 +8,8 @@ if [ -f /tmp/chatapp.pid ] && kill -0 "$(cat /tmp/chatapp.pid)" 2>/dev/null; the
   exit 1
 fi
 
-nohup .venv/bin/uvicorn server:app --host 127.0.0.1 --port 8765 \
+nohup .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8765 \
   > /tmp/chatapp.log 2>&1 &
 echo $! > /tmp/chatapp.pid
 sleep 1
-echo "started pid $(cat /tmp/chatapp.pid) — http://127.0.0.1:8765 — logs: /tmp/chatapp.log"
+echo "started pid $(cat /tmp/chatapp.pid) — http://$(ip route get 1.1.1.1 | awk '{print $7; exit}'):8765 — logs: /tmp/chatapp.log"

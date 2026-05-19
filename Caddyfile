@@ -1,0 +1,12 @@
+{
+    auto_https disable_redirects
+    local_certs
+    servers {
+        protocols h1 h2
+    }
+}
+
+{$TLS_HOST}:8443 {
+    tls internal
+    reverse_proxy 127.0.0.1:8765
+}

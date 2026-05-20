@@ -693,14 +693,29 @@ async def ws_endpoint(ws: WebSocket, cid: str):
                         # stop/abort from a previous reply.
                         conv._stop.clear()
                         conv._abort.clear()
-                        # Kick the avatar session opener in the background but
-                        # don't block — Ditto cold-start can take >30s when
-                        # Ollama is loading qwen3 into the same VRAM, and we
-                        # don't want the LLM/text reply to wait. If the bridge
-                        # isn't ready by the time the first TTS chunk arrives,
-                        # that one reply just won't be lip-synced.
                         if conv.avatar_mode:
-                            asyncio.create_task(ensure_avatar_session(cid))
+                            if conv.turns_taken > 0:
+                                # Reset Ditto between turns: its model holds the
+                                # previous turn's last ~70 frames in a lookahead
+                                # buffer, which would otherwise flush into this
+                                # turn and offset lipsync. Close + reopen gives a
+                                # fresh pre-pad. Await it (warm reopen is quick)
+                                # so audio isn't fed before the session is ready;
+                                # cap the wait so a slow reopen can't hang the
+                                # reply — that one turn just won't be lip-synced.
+                                await close_avatar_session(cid)
+                                try:
+                                    await asyncio.wait_for(ensure_avatar_session(cid), timeout=5.0)
+                                except asyncio.TimeoutError:
+                                    asyncio.create_task(ensure_avatar_session(cid))
+                                except Exception as e:
+                                    print(f"[avatar {cid}] reopen failed: {e!r}")
+                            else:
+                                # First turn: session was opened on connect; kick
+                                # the opener in case it isn't up yet. Don't block —
+                                # cold-start can take >30s while Ollama loads the
+                                # model into the same VRAM.
+                                asyncio.create_task(ensure_avatar_session(cid))
                         conv.running = True
                         await broadcast(cid, {"type": "state", "running": True})
 

@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from photoreal import DittoBridge
 import tools as web_tools
+import memory as avatar_memory
 
 OLLAMA_URL = "http://localhost:11434"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -393,8 +394,17 @@ def build_messages_for(conv: Conversation, speaker_idx: int) -> list[dict]:
     """
     speaker = conv.participants[speaker_idx]
     out: list[dict] = []
+    system_parts = []
     if (speaker.system or "").strip():
-        out.append({"role": "system", "content": speaker.system.strip()})
+        system_parts.append(speaker.system.strip())
+    mem = avatar_memory.load_memory(speaker.name)
+    if mem:
+        system_parts.append(
+            "Things you remember about the user from past conversations:\n" + mem +
+            "\n\nWhen you learn a new durable fact worth keeping, save it with the remember tool."
+        )
+    if system_parts:
+        out.append({"role": "system", "content": "\n\n".join(system_parts)})
     for m in conv.messages:
         if m.sender < 0:
             continue  # internal note (was -1 referee or -2 system)
@@ -448,7 +458,8 @@ async def run_llm_turn(conv: Conversation, speaker_idx: int) -> str:
             round_content = ""
             tool_calls = None
             async for c_delta, t_delta, tcs in ollama_stream(
-                speaker.model, convo, think=conv.thinking_mode, tools=web_tools.TOOL_SCHEMAS,
+                speaker.model, convo, think=conv.thinking_mode,
+                tools=web_tools.TOOL_SCHEMAS + [avatar_memory.REMEMBER_TOOL_SCHEMA],
             ):
                 if conv._abort.is_set():
                     break
@@ -488,7 +499,10 @@ async def run_llm_turn(conv: Conversation, speaker_idx: int) -> str:
                 note = f"\n🔎 {name}({', '.join(f'{k}={v}' for k, v in args.items())})\n"
                 msg.thinking += note
                 await broadcast(conv.id, {"type": "thinking", "id": msg.id, "delta": note})
-                result = await web_tools.execute_tool(name, args)
+                if name == "remember":
+                    result = avatar_memory.append_memory(speaker.name, args.get("fact", ""))
+                else:
+                    result = await web_tools.execute_tool(name, args)
                 convo.append({"role": "tool", "content": result, "tool_name": name})
     except Exception as e:
         msg.content += f"\n\n[error: {e}]"

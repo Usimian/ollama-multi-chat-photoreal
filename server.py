@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from photoreal import DittoBridge
+import tools as web_tools
 
 OLLAMA_URL = "http://localhost:11434"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -212,13 +213,13 @@ async def ollama_models() -> list[str]:
         return sorted(m["name"] for m in r.json().get("models", []))
 
 
-async def ollama_stream(model: str, messages: list[dict], think: bool = True):
-    """Yield (content_delta, thinking_delta) pairs from Ollama /api/chat.
-    `think` matches conv.thinking_mode. With `/no_think` in the user message
-    AND `think: true`, qwen3 sometimes puts the reply into the thinking field
-    instead of content — they're conflicting signals. So when thinking is off
-    we set `think: false`, and when on we set `think: true`."""
+async def ollama_stream(model: str, messages: list[dict], think: bool = True, tools: Optional[list] = None):
+    """Yield (content_delta, thinking_delta, tool_calls) from Ollama /api/chat.
+    `tool_calls` is None except on the chunk where the model requests tools.
+    `think` matches conv.thinking_mode."""
     payload = {"model": model, "messages": messages, "stream": True, "think": bool(think)}
+    if tools:
+        payload["tools"] = tools
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as r:
             r.raise_for_status()
@@ -230,7 +231,7 @@ async def ollama_stream(model: str, messages: list[dict], think: bool = True):
                 except json.JSONDecodeError:
                     continue
                 m = obj.get("message", {})
-                yield m.get("content", ""), m.get("thinking", "")
+                yield m.get("content", ""), m.get("thinking", ""), m.get("tool_calls") or None
                 if obj.get("done"):
                     return
 
@@ -435,27 +436,60 @@ async def run_llm_turn(conv: Conversation, speaker_idx: int) -> str:
         asyncio.create_task(_tts_worker(conv, msg.id, tts_queue)) if tts_queue else None
     )
     sentence_buffer = ""
+    # Working message list for the tool loop. The model may ask to call tools
+    # (web_search / fetch_url); we run them, append the results, and re-query
+    # until it produces a normal answer. Capped so a tool-happy model can't loop
+    # forever. Casual messages never trigger a call — the model only uses tools
+    # when it needs info past its knowledge cutoff.
+    convo = list(request_messages)
+    MAX_TOOL_ROUNDS = 5
     try:
-        async for c_delta, t_delta in ollama_stream(
-            speaker.model,
-            request_messages,
-            think=conv.thinking_mode,
-        ):
-            if conv._abort.is_set():
+        for _round in range(MAX_TOOL_ROUNDS):
+            round_content = ""
+            tool_calls = None
+            async for c_delta, t_delta, tcs in ollama_stream(
+                speaker.model, convo, think=conv.thinking_mode, tools=web_tools.TOOL_SCHEMAS,
+            ):
+                if conv._abort.is_set():
+                    break
+                if tcs:
+                    tool_calls = tcs
+                # Ollama splits the stream: c_delta is answer text, t_delta is
+                # reasoning. Tool-call rounds carry no content, so streaming it
+                # straight to TTS is safe.
+                if c_delta:
+                    round_content += c_delta
+                    msg.content += c_delta
+                    await broadcast(conv.id, {"type": "token", "id": msg.id, "delta": c_delta})
+                    if tts_queue is not None:
+                        sentence_buffer += c_delta
+                        sentences, sentence_buffer = _pop_sentences(sentence_buffer)
+                        for s in sentences:
+                            await tts_queue.put(s)
+                if t_delta:
+                    msg.thinking += t_delta
+                    await broadcast(conv.id, {"type": "thinking", "id": msg.id, "delta": t_delta})
+
+            if conv._abort.is_set() or not tool_calls:
                 break
-            # Ollama splits the stream for us: c_delta is the answer text only,
-            # t_delta is the reasoning. We just route them to the right places.
-            if c_delta:
-                msg.content += c_delta
-                await broadcast(conv.id, {"type": "token", "id": msg.id, "delta": c_delta})
-                if tts_queue is not None:
-                    sentence_buffer += c_delta
-                    sentences, sentence_buffer = _pop_sentences(sentence_buffer)
-                    for s in sentences:
-                        await tts_queue.put(s)
-            if t_delta:
-                msg.thinking += t_delta
-                await broadcast(conv.id, {"type": "thinking", "id": msg.id, "delta": t_delta})
+
+            # Model requested tools. Record its tool-call turn, run each tool,
+            # feed the results back, and loop for another round.
+            convo.append({"role": "assistant", "content": round_content, "tool_calls": tool_calls})
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                note = f"\n🔎 {name}({', '.join(f'{k}={v}' for k, v in args.items())})\n"
+                msg.thinking += note
+                await broadcast(conv.id, {"type": "thinking", "id": msg.id, "delta": note})
+                result = await web_tools.execute_tool(name, args)
+                convo.append({"role": "tool", "content": result, "tool_name": name})
     except Exception as e:
         msg.content += f"\n\n[error: {e}]"
         await broadcast(conv.id, {"type": "token", "id": msg.id, "delta": f"\n\n[error: {e}]"})

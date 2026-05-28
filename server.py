@@ -9,11 +9,21 @@ import asyncio
 import base64
 import io
 import json
+import os
 import re
 import uuid
+import warnings
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
+
+# Sparse terminal by default: hide third-party deprecation/user warnings (torch,
+# via Kokoro) so the warmup checklist stays readable. The subsystem checklist
+# still prints. Run with --verbose (AVATAR_VERBOSE=1) to see everything.
+VERBOSE = os.environ.get("AVATAR_VERBOSE", "") not in ("", "0", "false", "False")
+if not VERBOSE:
+    warnings.filterwarnings("ignore", category=UserWarning, module=r"torch\..*")
+    warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch\..*")
 
 import httpx
 import numpy as np
@@ -570,10 +580,76 @@ async def llm_llm_loop(conv: Conversation) -> None:
 app = FastAPI()
 
 
+def _print_urls() -> None:
+    """Print the access banner last (after the warmup checklist) so it stays
+    visible. Host/IP come from start.sh via env; skip if launched directly."""
+    tls = os.environ.get("TLS_HOST")
+    if not tls:
+        return
+    lan = os.environ.get("LAN_IP", "")
+    lines = [
+        "",
+        "================================================================",
+        "  Open the app at:",
+        "    This machine:    http://127.0.0.1:8765",
+        f"    Other devices:   https://{tls}:8443   (accept the cert on first visit)",
+    ]
+    if lan:
+        lines.append(f"                     https://{lan}:8443   (if .local doesn't resolve)")
+    lines += ["================================================================", ""]
+    print("\n".join(lines), flush=True)
+
+
+async def _warm_step(label: str, coro) -> None:
+    """Run one warmup step and print an aligned status line as it completes."""
+    import time
+    t0 = time.perf_counter()
+    try:
+        await coro
+        print(f"  {label:.<26} ✓  ({time.perf_counter() - t0:.1f}s)", flush=True)
+    except Exception as e:
+        print(f"  {label:.<26} ✗  {e!r}", flush=True)
+
+
+async def _ollama_load(model: str) -> None:
+    async with httpx.AsyncClient(timeout=120) as client:
+        await client.post(f"{OLLAMA_URL}/api/chat",
+                          json={"model": model, "messages": [], "stream": False})
+
+
+async def _ditto_warm() -> None:
+    bridge = await _get_bridge()
+    await bridge.open_session("__warmup__", ref_image_path=str(AVATAR_REF), max_size=512)
+    await bridge.close_session("__warmup__")
+
+
+async def _warmup() -> None:
+    """Preload the heavy subsystems in the background so the first real query
+    doesn't race cold-start. The server is already serving by the time this
+    runs. Each step is independent; a failure is shown and the rest continue."""
+    # Let uvicorn finish printing its own startup lines first, so the checklist
+    # below prints as one contiguous block instead of interleaving with them.
+    await asyncio.sleep(0.8)
+    print("\n──────────── warming up subsystems ────────────", flush=True)
+    await _warm_step("Whisper (STT)", asyncio.to_thread(_get_whisper))
+    await _warm_step("Kokoro (TTS)", asyncio.to_thread(_synthesize, "Ready.", "af_heart"))
+    if AVATAR_REF.exists():
+        await _warm_step("Ditto avatar", _ditto_warm())
+    models = {p.model for c in conversations.values()
+              for p in c.participants if p.kind == "llm" and p.model}
+    for m in sorted(models):
+        await _warm_step(f"Ollama: {m}", _ollama_load(m))
+    print("──────────── ready for first query ────────────", flush=True)
+    if not VERBOSE:
+        print("  (--verbose for detail · worker log: /tmp/ditto-worker.log)", flush=True)
+    _print_urls()
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     load_all()
     print(f"loaded {len(conversations)} conversation(s) from {DATA_DIR}")
+    asyncio.create_task(_warmup())
 
 
 @app.on_event("shutdown")
@@ -828,6 +904,15 @@ async def ws_endpoint(ws: WebSocket, cid: str):
         pass
     finally:
         sockets.get(cid, set()).discard(ws)
+        # When the last client for this conversation leaves (e.g. you switched
+        # to another chat), close its Ditto session. Otherwise sessions leak —
+        # each chat you visit leaves one running on the worker, piling up GPU
+        # memory until the worker degrades and animation stops everywhere.
+        if not sockets.get(cid):
+            try:
+                await close_avatar_session(cid)
+            except Exception:
+                pass
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

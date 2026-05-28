@@ -36,6 +36,11 @@ DITTO_PY = os.path.join(DITTO_DIR, ".venv/bin/python")
 # files inside the upstream Ditto checkout.
 DITTO_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker", "ditto_worker.py")
 DEFAULT_SOCK = "/tmp/ditto.sock"
+WORKER_LOG = "/tmp/ditto-worker.log"
+# When false, the worker's chatty output is redirected to WORKER_LOG so the
+# server terminal stays readable. Set AVATAR_VERBOSE=1 (start.sh --verbose) to
+# let it stream to the terminal instead.
+VERBOSE = os.environ.get("AVATAR_VERBOSE", "") not in ("", "0", "false", "False")
 
 CHUNK_16K = 3200            # 200 ms @ 16 kHz mono
 SENTINEL_END = object()
@@ -74,6 +79,7 @@ class DittoBridge:
         self._reader_task: Optional[asyncio.Task] = None
         self._sessions: dict[str, _Session] = {}
         self._started = asyncio.Event()
+        self._log = None
 
     # ---------- lifecycle ----------
 
@@ -82,11 +88,17 @@ class DittoBridge:
             return
         if os.path.exists(self.sock_path):
             os.unlink(self.sock_path)
+        # Unless verbose, redirect the worker's very chatty output (mediapipe/EGL
+        # banners, the SDK's setup-kwargs dump, onnxruntime shape warnings, tqdm
+        # progress) to a logfile so the server terminal stays readable.
+        self._log = None if VERBOSE else open(WORKER_LOG, "w")
         self._proc = await asyncio.create_subprocess_exec(
             self.worker_python, self.worker_script,
             "--sock", self.sock_path,
             "--ditto-dir", DITTO_DIR,
             cwd=DITTO_DIR,
+            stdout=self._log,
+            stderr=(asyncio.subprocess.STDOUT if self._log else None),
         )
         # wait for socket
         deadline = asyncio.get_event_loop().time() + startup_timeout
@@ -123,6 +135,12 @@ class DittoBridge:
         for sess in self._sessions.values():
             await sess.frame_q.put(SENTINEL_END)
         self._sessions.clear()
+        if self._log is not None:
+            try:
+                self._log.close()
+            except Exception:
+                pass
+            self._log = None
         self._proc = None
         self._reader = None
         self._writer = None

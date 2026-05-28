@@ -549,6 +549,7 @@ async def run_llm_turn(conv: Conversation, speaker_idx: int) -> str:
 
     await broadcast(conv.id, {"type": "message_end", "id": msg.id})
     persist(conv)
+    print(f"[{conv.title}] {speaker.name} ◀ {msg.content.strip()}", flush=True)
     return msg.content
 
 
@@ -812,6 +813,7 @@ async def ws_endpoint(ws: WebSocket, cid: str):
                     continue
                 msg = Message(id=str(uuid.uuid4()), sender=idx, content=data["content"])
                 conv.messages.append(msg)
+                print(f"[{conv.title}] {conv.participants[idx].name} ▶ {msg.content}", flush=True)
                 await broadcast(cid, {"type": "message_start", "message": asdict(msg)})
                 await broadcast(cid, {"type": "message_end", "id": msg.id})
                 persist(conv)

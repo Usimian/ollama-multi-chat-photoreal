@@ -6,7 +6,7 @@
     }
 }
 
-{$TLS_HOST}:8443 {
+{$TLS_HOST}:8443, {$LAN_IP}:8443 {
     tls internal
     reverse_proxy 127.0.0.1:8765
 }

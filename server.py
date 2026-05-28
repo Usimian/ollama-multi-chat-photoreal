@@ -205,14 +205,21 @@ async def ensure_avatar_session(cid: str) -> None:
 
 
 async def close_avatar_session(cid: str) -> None:
-    task = _avatar_sessions.pop(cid, None)
-    if task and not task.done():
-        task.cancel()
-    if _bridge is not None:
-        try:
-            await _bridge.close_session(cid)
-        except Exception:
-            pass
+    # Acquire the SAME per-cid lock ensure_avatar_session uses, so a close can
+    # never interleave with an in-flight open. Without this, a close that lands
+    # while open_session is still awaiting the worker leaves _avatar_sessions
+    # pointing at a fanout whose bridge session was already torn down — the
+    # session looks open but produces no frames (the intermittent "no lips" bug).
+    lock = _avatar_starting.setdefault(cid, asyncio.Lock())
+    async with lock:
+        task = _avatar_sessions.pop(cid, None)
+        if task and not task.done():
+            task.cancel()
+        if _bridge is not None:
+            try:
+                await _bridge.close_session(cid)
+            except Exception:
+                pass
 
 
 # ---------- Ollama ----------
@@ -819,26 +826,21 @@ async def ws_endpoint(ws: WebSocket, cid: str):
                         conv._abort.clear()
                         if conv.avatar_mode:
                             if conv.turns_taken > 0:
-                                # Reset Ditto between turns: its model holds the
-                                # previous turn's last ~70 frames in a lookahead
-                                # buffer, which would otherwise flush into this
-                                # turn and offset lipsync. Close + reopen gives a
-                                # fresh pre-pad. Await it (warm reopen is quick)
-                                # so audio isn't fed before the session is ready;
-                                # cap the wait so a slow reopen can't hang the
-                                # reply — that one turn just won't be lip-synced.
+                                # Reset Ditto each turn with a fresh session so the
+                                # previous turn's lookahead can't bleed in (clean
+                                # lip-sync). The worker frees GPU memory on close, so
+                                # this no longer accumulates; the shared open/close
+                                # lock keeps it race-free. Await the reopen so audio
+                                # isn't fed before the session is ready; cap the wait
+                                # so a slow reopen can't hang the reply.
                                 await close_avatar_session(cid)
                                 try:
-                                    await asyncio.wait_for(ensure_avatar_session(cid), timeout=5.0)
+                                    await asyncio.wait_for(ensure_avatar_session(cid), timeout=8.0)
                                 except asyncio.TimeoutError:
                                     asyncio.create_task(ensure_avatar_session(cid))
                                 except Exception as e:
                                     print(f"[avatar {cid}] reopen failed: {e!r}")
                             else:
-                                # First turn: session was opened on connect; kick
-                                # the opener in case it isn't up yet. Don't block —
-                                # cold-start can take >30s while Ollama loads the
-                                # model into the same VRAM.
                                 asyncio.create_task(ensure_avatar_session(cid))
                         conv.running = True
                         await broadcast(cid, {"type": "state", "running": True})

@@ -170,6 +170,18 @@ class Session:
             self.sdk.close()
         except Exception:
             traceback.print_exc()
+        # Free the SDK's GPU memory. StreamSDK reserves several GB of CUDA
+        # memory per instance; without dropping the reference and emptying
+        # torch's cache, opening a fresh session each turn accumulates until
+        # the GPU is exhausted and frame production silently stops.
+        self.sdk = None
+        try:
+            import gc
+            import torch
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def handle_client(sock: socket.socket) -> None:

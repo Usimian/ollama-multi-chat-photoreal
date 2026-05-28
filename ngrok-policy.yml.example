@@ -1,0 +1,11 @@
+# Template for the ngrok tunnel auth policy. Copy to ngrok-policy.yml (which is
+# gitignored) and set your own credentials:
+#   cp ngrok-policy.yml.example ngrok-policy.yml
+#   # edit the user:password line
+on_http_request:
+  - actions:
+      - type: basic-auth
+        config:
+          realm: "Photoreal Chatbot"
+          credentials:
+            - "CHANGE_ME_USER:CHANGE_ME_PASSWORD"

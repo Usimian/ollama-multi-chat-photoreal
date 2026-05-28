@@ -5,3 +5,6 @@ data/
 *.log
 tmp/
 dump_kokoro.py
+
+# ngrok tunnel auth (contains credentials)
+ngrok-policy.yml
